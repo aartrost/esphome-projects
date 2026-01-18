@@ -1,0 +1,243 @@
+# Symbolic name to GPIO pin map
+# D4  -> GPIO4
+# RX2 -> GPIO16
+# TX2 -> GPIO17
+# D18 -> GPIO18
+# D19 -> GPIO19
+# D21 -> GPIO21
+# D22 -> GPIO22
+# D23 -> GPIO23
+
+# D13 -> GPIO13
+# D14 -> GPIO14
+# D27 -> GPIO27
+# D26 -> GPIO26
+# D25 -> GPIO25
+# D33 -> GPIO33
+# D32 -> GPIO32
+
+# potentially usable pins
+# D5
+# D15
+
+esphome:
+  name: alarm-system
+  friendly_name: Alarm System Controller
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+web_server:
+
+api:
+  encryption:
+    key: !secret home_assistant_key
+
+ota:
+  - platform: esphome
+
+# Enable logging
+logger:
+  level: info
+
+captive_portal:
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: "alarm-system"
+
+button:
+  - platform: restart
+    name: "Restart Controller"
+
+text_sensor:
+
+  - platform: uptime
+    name: Uptime
+    update_interval: 1d
+    format:
+      separator: " "
+      days: "D"
+
+binary_sensor:
+
+  - platform: status
+    name: "Connection"
+
+  - platform: gpio
+    name: "Master Bath Window"
+    id: D4
+    device_class: window
+    pin: 
+      number: GPIO4
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Master Bath Exterior Door"
+    id: RX2
+    device_class: door
+    pin: 
+      number: GPIO16
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Guest Bath Window"
+    id: TX2
+    device_class: window
+    pin: 
+      number: GPIO17
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Laundry Room Window"
+    id: D18
+    device_class: window
+    pin: 
+      number: GPIO18
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Front Door"
+    id: D19
+    device_class: door
+    pin: 
+      number: GPIO19
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Telephone Cover Exterior"
+    id: D21
+    device_class: lock
+    pin: 
+      number: GPIO21
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "line 7"
+    id: D22
+    device_class: ""
+    pin: 
+      number: GPIO22
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "line 8"
+    id: D23
+    device_class: ""
+    pin: 
+      number: GPIO23
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Living Room Side Window"
+    id: D13
+    device_class: window
+    pin: 
+      number: GPIO13
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Upstairs Bathroom Window"
+    id: D14
+    device_class: window
+    pin: 
+      number: GPIO14
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Kitchen Window"
+    id: D27
+    device_class: window
+    pin: 
+      number: GPIO27
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Balcony Door"
+    id: D26
+    device_class: door
+    pin: 
+      number: GPIO26
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+  - platform: gpio
+    name: "Downstairs Hallway Motion"
+    id: D25
+    device_class: motion
+    pin: 
+      number: GPIO25
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 0ms
+      - delayed_off: 30s
+
+  - platform: gpio
+    name: "Kitchen Motion"
+    id: D33
+    device_class: motion
+    pin: 
+      number: GPIO33
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 0ms
+      - delayed_off: 30s
+
+  - platform: gpio
+    name: "Downstairs Hallway Ceiling"
+    id: D32
+    device_class: ""
+    pin: 
+      number: GPIO32
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+
+sensor:
+
+  # Reports the WiFi signal strength/RSSI in dB
+  - platform: wifi_signal
+    name: "WiFi Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"

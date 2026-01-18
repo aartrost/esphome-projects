@@ -1,0 +1,1 @@
+xkc-y25-npn sensor holder by gipper65 on Thingiverse: https://www.thingiverse.com/thing:3464540

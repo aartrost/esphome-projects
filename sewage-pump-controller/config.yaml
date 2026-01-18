@@ -1,0 +1,373 @@
+# Symbolic name to GPIO pin map
+#  D0 =  GPIO0
+#  D1 =  GPIO1
+#  D2 =  GPIO2
+#  D3 = GPIO21
+#  D4 = GPIO22
+#  D5 = GPIO23
+#  D6 = GPIO16
+#  D7 = GPIO17
+#  D8 = GPIO19
+#  D9 = GPIO20
+# D10 = GPIO18
+
+esphome:
+  name: sewage-pump-controller
+  friendly_name: Sewage Pump Controller
+  on_boot:
+    priority: 800
+    then:
+      # https://github.com/esphome/issues/issues/5864#issuecomment-2664149949
+      - output.turn_off: wifi_switch_enable
+      # Set sensors NC mode so that we always assume water is detected
+      # unless the sensor tells us there's no water. This is a safety precaution
+      # in case a sensor fails or unplugs. In that case we will assume water is 
+      # present and trigger the safety features
+      - output.turn_off: overflow_threshold_mode
+      - output.turn_off: high_threshold_mode
+      - output.turn_off: low_threshold_mode
+
+esp32:
+  board: seeed_xiao_esp32c6
+  framework:
+    type: esp-idf
+
+web_server:
+
+api:
+  encryption:
+    key: !secret home_assistant_key
+
+ota:
+  - platform: esphome
+
+# Enable logging
+logger:
+  baud_rate: 115200
+  hardware_uart: USB_SERIAL_JTAG
+  level: info
+
+captive_portal:
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  on_connect:
+    - output.turn_on: onboard_led
+  on_disconnect:
+    - output.turn_off: onboard_led
+
+  ap:
+    ssid: "sewage-pump-controller"
+
+globals:
+  ###
+  # Update this timeout to control how long the high level threshold sensor
+  # can be active. If this times out we assume the pump is faulty as the
+  # water level is not receding when powering the pump relay
+  ###
+
+  - id: pump_timeout_duration
+    type: int
+    restore_value: no
+    # max pump runtime per cycle (120s)
+    initial_value: '120000'
+
+  - id: pump_timed_out
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  ###
+  # Update this timeout to control how long the high level threshold sensor
+  # can be active. If this times out we assume the pump is faulty as the
+  # water level is not receding when powering the pump relay
+  ###
+
+  - id: pump_high_water_timeout
+    type: int
+    restore_value: no
+    # max pump runtime till high water should be cleared (15s)
+    initial_value: '15000'
+
+  - id: pump_not_pumping
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+script:
+  - id: run_pump
+    mode: single
+    then:
+      - switch.turn_on: pump_relay
+        # Normally the low water sensor would stop this script
+        # but we also time out in case the pump runs for too long
+      - delay: !lambda 'return id(pump_timeout_duration);'
+      - switch.turn_off: pump_relay
+        # Set the global timeout variable so the pump isn't started
+        # again until a change in state was detected
+      - globals.set:
+          id: pump_timed_out
+          value: 'true'
+      - logger.log: 
+            format: "Pump ran for more than %is. Timing out..."
+            args: id(pump_timeout_duration) / 1000
+            level: ERROR
+      # check water levels. Trigger alert if pump timed out while
+      # water levels are still at high or overflow levels.
+
+button:
+  - platform: restart
+    name: "Restart Controller"
+
+switch:
+  - platform: gpio
+    id: "pump_relay"
+    pin: GPIO18
+    internal: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      then:
+        - logger.log:
+            format: "Pump is running!"
+            level: INFO
+    on_turn_off:
+      then:
+        - logger.log: 
+            format: "Pump is off!"
+            level: INFO
+
+  - platform: gpio
+    name: "use external antenna"
+    pin: GPIO14
+    restore_mode: ALWAYS_ON
+
+    # public switch that calls the safe `run_pump` script
+    # so it's not possible to remotely run the pump indefinitely
+  - platform: template
+    id: "run_pump_switch"
+    lambda: !lambda 'return id(pump_relay).state;'
+    name: "Start pump"
+    turn_on_action:
+        # reset pump timeout when manually running
+        - globals.set:
+            id: pump_timed_out
+            value: 'false'
+        - script.execute: run_pump
+    turn_off_action:
+        - script.stop: run_pump
+        - switch.turn_off: pump_relay
+
+interval:
+  # check tank & pump state every 1 second
+  - interval: 1s
+    then:
+      - lambda: |-
+
+          if (
+            // tank is full
+            id(high_threshold_exceeded).state
+            // tank is overflowing
+            || id(overflow_threshold_exceeded).state
+          ) {
+
+            if(
+              // if not running
+              !id(run_pump).is_running()
+              // and not timed out
+              && !id(pump_timed_out)
+            ) {
+              ESP_LOGI("main", "Full tank detected, start the pump.");
+              id(run_pump).execute();
+            }
+
+          } else if (
+            // tank is empty
+            !id(low_threshold_exceeded).state
+          ) {
+
+            // stop pump if still running
+            if(
+              id(run_pump).is_running()
+            ) {
+              ESP_LOGI("main", "Empty tank detected, stop the pump.");
+              // stop the script
+              id(run_pump).stop();
+              // stop the pump
+              id(pump_relay).turn_off();
+            }
+
+          }
+
+text_sensor:
+
+  - platform: template
+    id: basin_level
+    name: "Basin level"
+    lambda: |-
+      if(id(overflow_threshold_exceeded).state) {
+        return {"overflowing"};
+      } else if (id(high_threshold_exceeded).state) {
+        return {"full"};
+      } else if (id(low_threshold_exceeded).state) {
+        return {"normal"};
+      }
+      
+      return {"empty"};
+
+  - platform: uptime
+    name: Uptime
+    update_interval: 1d
+    format:
+      separator: " "
+      days: "D"
+
+binary_sensor:
+
+  - platform: status
+    name: "Connection"
+
+  - platform: template
+    id: pump_max_runtime_exceeded
+    name: "Pump max runtime exceeded"
+    lambda: !lambda 'return id(pump_timed_out);'
+    device_class: problem
+  
+  - platform: template
+    id: pump_malfunction_detected
+    name: "Pump malfunction detected"
+    lambda: !lambda 'return id(pump_not_pumping);'
+    device_class: problem
+
+  # overflow water sensor sense pin D1 PNP mode pin D0
+  - platform: gpio
+    id: "overflow_threshold_exceeded"
+    name: "Overflow"
+    filters:
+      # only report if the state is stable for > 500ms
+      - delayed_on: 500ms
+      - delayed_off: 500ms
+    pin: 
+      number: GPIO1 # D1
+      inverted: false
+      mode: INPUT_PULLUP
+    device_class: moisture
+    on_state:
+      - component.update: basin_level
+      # reset pump timeout on sensor state change
+      - globals.set:
+          id: pump_timed_out
+          value: 'false'
+      - logger.log: 
+            format: "Pump timeout cleared..."
+            level: INFO
+
+  # full tank sensor sensor sense pin D4 PNP mode pin D5
+  - platform: gpio
+    id: "high_threshold_exceeded"
+    name: "High water"
+    filters:
+      # only report if the state is stable for > 500ms
+      - delayed_on: 500ms
+      - delayed_off: 500ms
+    pin: 
+      number: GPIO22 # D4
+      inverted: false
+      mode: INPUT_PULLUP
+    device_class: moisture
+    on_press:
+      then: 
+        - delay: !lambda 'return id(pump_high_water_timeout);'
+        - if:
+            condition:
+              binary_sensor.is_on: high_threshold_exceeded
+            then: 
+              # High level sensor is triggered for >$pump_high_water_timeout seconds means
+              # the pump is not running or running but not moving liquid
+              - globals.set:
+                  id: pump_not_pumping
+                  value: 'true'
+              - logger.log: 
+                  format: "Pump is running but liquid level is not changing!"
+                  level: INFO
+    on_state:
+      - component.update: basin_level
+      # reset pump timeout on sensor state change
+      - globals.set:
+          id: pump_timed_out
+          value: 'false'
+      # reset pump not working status
+      - globals.set:
+          id: pump_not_pumping
+          value: 'false'
+      - logger.log: 
+            format: "Pump timeout cleared..."
+            level: INFO
+
+  # low tank sensor sensor sense pin D6 PNP mode pin D7
+  - platform: gpio
+    id: "low_threshold_exceeded"
+    name: "Low water"
+    filters:
+      # only report if the state is stable for > 500ms
+      - delayed_on: 500ms
+      # Run the pump for 30 seconds after threshold was reached. This
+      # results in less cycles per day and hopefully less wear on the pump
+      # - delayed_off: 30s
+    pin: 
+      number: GPIO16 # D6
+      inverted: false
+      mode: INPUT_PULLUP
+    device_class: moisture
+    on_state:
+      - component.update: basin_level
+      # reset pump timeout on sensor state change
+      - globals.set:
+          id: pump_timed_out
+          value: 'false'
+      - logger.log: 
+            format: "Pump timeout cleared..."
+            level: INFO
+
+sensor:
+
+  - platform: duty_time
+    id: pump_duty_time
+    name: Total run time
+    lambda: !lambda 'return id(pump_relay).state;'
+    restore: true
+    last_time:
+      name: Last run time
+
+  # Reports the WiFi signal strength/RSSI in dB
+  - platform: wifi_signal
+    name: "WiFi Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+output:
+  # enable antenna switch for better wifi reception
+  # https://github.com/esphome/issues/issues/5864#issuecomment-2664149949
+  # set to LOW to enable RF switch control
+  - platform: gpio
+    id: wifi_switch_enable
+    pin: GPIO3
+  # `overflow_threshold_exceeded` PNP mode selector (pin D0)
+  - platform: gpio
+    id: overflow_threshold_mode
+    pin: GPIO0
+  # `high_threshold_exceeded` PNP mode selector (pin D5)
+  - platform: gpio
+    id: high_threshold_mode
+    pin: GPIO23
+  # `low_threshold_exceeded` PNP mode selector (pin D7)
+  - platform: gpio
+    id: low_threshold_mode
+    pin: GPIO17
+  # onboard LED
+  - platform: gpio
+    id: onboard_led
+    pin: 
+      number: GPIO15
+      inverted: true

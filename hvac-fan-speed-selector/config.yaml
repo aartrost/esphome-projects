@@ -1,0 +1,194 @@
+esphome:
+  name: hvac-fan-speed-controller
+
+esp32:
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: arduino
+
+web_server:
+
+api:
+  encryption:
+    key: !secret home_assistant_key
+
+ota:
+  - platform: esphome
+
+# Enable logging
+logger:
+  level: info
+
+captive_portal:
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: "hvac-speed-controller"
+
+binary_sensor:
+  - platform: status
+    name: "Status"
+
+  - platform: gpio
+    name: "Boot Button"
+    pin:
+      number: 0
+      ignore_strapping_warning: true
+      mode:
+        input: true
+      inverted: true
+    disabled_by_default: true
+    on_press:
+      then:
+        - button.press: restart_button
+
+sensor:
+  - platform: wifi_signal # Reports the WiFi signal strength/RSSI in dB
+    name: "WiFi Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+  - platform: copy # Reports the WiFi signal strength in %
+    source_id: wifi_signal_db
+    name: "WiFi Signal"
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: "%"
+    entity_category: "diagnostic"
+    device_class: ""
+
+switch:
+  # Relay 1: LOW on NC (inverted logic - OFF = low connected)
+  - platform: gpio
+    pin: GPIO1
+    id: relay_disconnect_low
+    name: "Relay Disconnect Low"
+    internal: true
+    
+  - platform: gpio
+    pin: GPIO2
+    id: relay_fan_medium
+    name: "Fan Medium"
+    internal: true
+    
+  - platform: gpio
+    pin: GPIO41
+    id: relay_fan_high
+    name: "Fan High"
+    internal: true
+
+  # Spare relays
+  - platform: gpio
+    pin: GPIO42
+    id: relay4
+    name: Relay 4
+    internal: true
+  - platform: gpio
+    pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    id: relay5
+    name: Relay 5
+    internal: true
+  - platform: gpio
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    id: relay6
+    name: Relay 6
+    internal: true
+
+select:
+  - platform: template
+    name: "Fan Speed"
+    id: fan_speed_select
+    options:
+      - "Low"
+      - "Medium"
+      - "High"
+    initial_option: "Low"
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - logger.log:
+            format: "Fan speed set to %s"
+            args: ['x.c_str()']
+        - if:
+            condition:
+              lambda: 'return x == "Low";'
+            then:
+              - switch.turn_off: relay_fan_medium
+              - switch.turn_off: relay_fan_high
+              - switch.turn_off: relay_disconnect_low
+        - if:
+            condition:
+              lambda: 'return x == "Medium";'
+            then:
+              - switch.turn_off: relay_fan_high
+              - switch.turn_on: relay_disconnect_low
+              - switch.turn_on: relay_fan_medium
+        - if:
+            condition:
+              lambda: 'return x == "High";'
+            then:
+              - switch.turn_off: relay_fan_medium
+              - switch.turn_on: relay_disconnect_low
+              - switch.turn_on: relay_fan_high
+
+# number:
+#   - platform: template
+#     name: "Fan Speed"
+#     id: fan_speed_number
+#     min_value: 1
+#     max_value: 3
+#     step: 1
+#     initial_value: 1
+#     optimistic: true
+#     restore_value: true
+#     on_value:
+#       then:
+#         - logger.log:
+#             format: "Fan speed set to %.0f"
+#             args: ['x']
+#         - if:
+#             condition:
+#               lambda: 'return x == 1;'
+#             then:
+#               - switch.turn_off: relay_fan_medium
+#               - switch.turn_off: relay_fan_high
+#               - switch.turn_off: relay_disconnect_low
+#         - if:
+#             condition:
+#               lambda: 'return x == 2;'
+#             then:
+#               - switch.turn_off: relay_fan_high
+#               - switch.turn_on: relay_disconnect_low
+#               - switch.turn_on: relay_fan_medium
+#         - if:
+#             condition:
+#               lambda: 'return x == 3;'
+#             then:
+#               - switch.turn_off: relay_fan_medium
+#               - switch.turn_on: relay_disconnect_low
+#               - switch.turn_on: relay_fan_high
+
+button:
+  - platform: restart
+    name: "Restart"
+    id: restart_button
+    entity_category: config
+
+  # - platform: factory_reset
+  #   name: "Factory Reset"
+  #   id: reset
+  #   entity_category: config
+
+  - platform: safe_mode
+    name: "Safe Mode"
+    internal: false
+    entity_category: config
