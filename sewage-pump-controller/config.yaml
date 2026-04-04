@@ -17,8 +17,9 @@ esphome:
   on_boot:
     priority: 800
     then:
-      # https://github.com/esphome/issues/issues/5864#issuecomment-2664149949
-      - output.turn_off: wifi_switch_enable
+      # Enable external antenna by default (FM8625H RF switch)
+      - output.turn_off: rf_switch_enable    # LOW -> RF switch power ON
+      - output.turn_on: rf_antenna_select    # HIGH -> external antenna (U.FL)
       # Set sensors NC mode so that we always assume water is detected
       # unless the sensor tells us there's no water. This is a safety precaution
       # in case a sensor fails or unplugs. In that case we will assume water is 
@@ -137,10 +138,16 @@ switch:
             format: "Pump is off!"
             level: INFO
 
-  - platform: gpio
-    name: "use external antenna"
-    pin: GPIO14
+  - platform: template
+    name: "Use External Antenna"
+    optimistic: true
     restore_mode: ALWAYS_ON
+    turn_on_action:
+        - output.turn_off: rf_switch_enable    # LOW -> RF switch power ON
+        - output.turn_on: rf_antenna_select    # HIGH -> external antenna (U.FL/RF2)
+    turn_off_action:
+        - output.turn_off: rf_switch_enable    # LOW -> RF switch power ON
+        - output.turn_off: rf_antenna_select   # LOW -> internal antenna (PCB/RF1)
 
     # public switch that calls the safe `run_pump` script
     # so it's not possible to remotely run the pump indefinitely
@@ -346,13 +353,17 @@ sensor:
     update_interval: 60s
     entity_category: "diagnostic"
 
+# External antenna control using ESPHome 2025.12+ board aliases (FM8625H RF switch)
+# RF_SWITCH_EN (GPIO3) = RF switch power, RF_ANT_SELECT (GPIO14) = antenna selector
 output:
-  # enable antenna switch for better wifi reception
-  # https://github.com/esphome/issues/issues/5864#issuecomment-2664149949
-  # set to LOW to enable RF switch control
+  # RF_SWITCH_EN GPIO3
   - platform: gpio
-    id: wifi_switch_enable
-    pin: GPIO3
+    id: rf_switch_enable
+    pin: RF_SWITCH_EN
+  # RF_ANT_SELECT GPIO14
+  - platform: gpio
+    id: rf_antenna_select
+    pin: RF_ANT_SELECT
   # `overflow_threshold_exceeded` PNP mode selector (pin D0)
   - platform: gpio
     id: overflow_threshold_mode
