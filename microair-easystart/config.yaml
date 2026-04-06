@@ -236,8 +236,10 @@ sensor:
                 // Extract and log Last Start Peak
                 float last_start_peak = ((data[8] & 0xFF) + ((data[9] & 0xFF) * factor)) / 10.0;
                 ESP_LOGD("ble_client", "Last Start Peak: %.1f", last_start_peak);
-                id(_last_start_peak) = last_start_peak;
-                id(last_start_peak_sen).publish_state(last_start_peak);
+                if (last_start_peak >= 1.0) {
+                  id(_last_start_peak) = last_start_peak;
+                  id(last_start_peak_sen).publish_state(last_start_peak);
+                }
 
                 // Extract and log SCPT Delay
                 uint16_t scpt_delay = (data[10] & 0xFF) + ((data[11] & 0xFF) * 256);
