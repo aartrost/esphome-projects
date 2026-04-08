@@ -159,6 +159,7 @@ sensor:
     method: left
     filters:
         - multiply: 0.001
+        - round: 2
 
   - platform: integration
     name: "Energy (Total)"
@@ -172,6 +173,7 @@ sensor:
     restore: true
     filters:
         - multiply: 0.001
+        - round: 2
 
   - platform: ble_client
     type: characteristic
