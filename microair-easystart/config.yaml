@@ -56,7 +56,7 @@ esp32_ble:
 
 ble_client:
   - mac_address: CC:19:4C:13:EE:D8
-    id: ble_client_1
+    id: soft_starter_ble
     auto_connect: true
     on_connect:
         then:
@@ -94,13 +94,14 @@ text_sensor:
 sensor:
   - platform: ble_client
     type: rssi
-    ble_client_id: ble_client_1
+    ble_client_id: soft_starter_ble
     name: "Bluetooth RSSI"
+    update_interval: 10s
 
   - platform: wifi_signal
     id: wifi_signal_dbm
     name: "Wi‑Fi RSSI"
-    update_interval: 30s
+    update_interval: 60s
     entity_category: diagnostic
 
   - platform: template
@@ -174,7 +175,7 @@ sensor:
 
   - platform: ble_client
     type: characteristic
-    ble_client_id: ble_client_1
+    ble_client_id: soft_starter_ble
     service_uuid:        "d973f2e0-b19e-11e2-9e96-0800200c9a66"
     characteristic_uuid: "d973f2e1-b19e-11e2-9e96-0800200c9a66"
     name: "EasyStart Diag"
@@ -216,14 +217,13 @@ sensor:
             // Ensure there are enough bytes for extraction
             if (length >= 18) {
                 float factor = 256.0;
-                float powerfactor = id(power_factor_num).state;
 
                 // Extract and log Live Current
                 float live_current = ((data[4] & 0xFF) + ((data[5] & 0xFF) * factor)) / 10.0;
                 ESP_LOGD("ble_client", "Live Current: %.1f", live_current);
                 if (live_current >= 0.0 && live_current <= 50.0) {
                     id(live_current_sen).publish_state(live_current);
-                    id(live_power_sen).publish_state((live_current * 240.0) * powerfactor);
+                    id(live_power_sen).publish_state((live_current * 240.0));
                 } else {
                     ESP_LOGW("ble_client", "Live Current out of range (%.1f A), discarding", live_current);
                 }
@@ -277,18 +277,6 @@ sensor:
         // Return a dummy value to comply with the lambda return type
         return (float)length;
 
-number:
-  - platform: template
-    name: "Power Factor"
-    id: power_factor_num
-    min_value: 0.5
-    max_value: 1.0
-    step: 0.01
-    initial_value: 1.0
-    restore_value: true
-    optimistic: true
-    entity_category: config
-
 # Switches
 switch:
     - platform: template
@@ -316,11 +304,11 @@ switch:
                         - switch.is_on: easystart_read
                     then:
                         - ble_client.ble_write:
-                              id: ble_client_1
+                              id: soft_starter_ble
                               service_uuid: "d973f2e0-b19e-11e2-9e96-0800200c9a66"
                               characteristic_uuid: "d973f2e2-b19e-11e2-9e96-0800200c9a66"
                               value: [0x7B, 0x22, 0x43, 0x6D, 0x64, 0x22, 0x3A, 0x20, 0x52, 0x65, 0x61, 0x64, 0x4C, 0x69, 0x76, 0x65, 0x7D]
-                        - delay: 5s
+                        - delay: 1s
       turn_off_action:
           then:
               - switch.template.publish:
