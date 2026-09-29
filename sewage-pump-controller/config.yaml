@@ -110,12 +110,33 @@ script:
       - globals.set:
           id: pump_timed_out
           value: 'true'
-      - logger.log: 
+      - logger.log:
             format: "Pump ran for more than %is. Timing out..."
             args: id(pump_timeout_duration) / 1000
             level: ERROR
       # check water levels. Trigger alert if pump timed out while
       # water levels are still at high or overflow levels.
+
+  # Runs once the low sensor clears (basin empty). Waits the configured
+  # "Extra pump runtime" before actually stopping, so the pump keeps
+  # draining past the low sensor instead of stopping the instant it clears.
+  # Restarts its wait if the sensor bounces low->high->low again.
+  - id: stop_pump_delayed
+    mode: restart
+    then:
+      - delay: !lambda 'return (uint32_t) (id(pump_extra_runtime).state * 1000);'
+      - if:
+          condition:
+            lambda: |-
+              return id(run_pump).is_running()
+                && !id(high_threshold_exceeded).state
+                && !id(overflow_threshold_exceeded).state;
+          then:
+            - logger.log:
+                format: "Empty tank detected, stop the pump."
+                level: INFO
+            - script.stop: run_pump
+            - switch.turn_off: pump_relay
 
 button:
   - platform: restart
@@ -165,6 +186,20 @@ switch:
         - script.stop: run_pump
         - switch.turn_off: pump_relay
 
+number:
+  - platform: template
+    name: "Extra pump runtime"
+    id: pump_extra_runtime
+    icon: "mdi:timer-plus-outline"
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 60
+    step: 1
+    unit_of_measurement: s
+    entity_category: config
+
 interval:
   # check tank & pump state every 1 second
   - interval: 1s
@@ -189,21 +224,23 @@ interval:
             }
 
           } else if (
-            // tank is empty
+            // tank reads empty right now
             !id(low_threshold_exceeded).state
+            // pump is still going
+            && id(run_pump).is_running()
+            // ...but nothing is already waiting to stop it
+            && !id(stop_pump_delayed).is_running()
           ) {
-
-            // stop pump if still running
-            if(
-              id(run_pump).is_running()
-            ) {
-              ESP_LOGI("main", "Empty tank detected, stop the pump.");
-              // stop the script
-              id(run_pump).stop();
-              // stop the pump
-              id(pump_relay).turn_off();
-            }
-
+            // Normally stop_pump_delayed is kicked off by
+            // low_threshold_exceeded's on_release edge, so it can wait for
+            // "Extra pump runtime" before stopping. This is the backstop:
+            // if that edge was ever missed (reboot mid-cycle, a stuck or
+            // misreading low sensor that never produces another edge),
+            // this catches it within ~1s instead of leaving the 120s
+            // malfunction timeout as the only thing that ever stops the
+            // pump.
+            ESP_LOGW("main", "Low sensor off but pump still running with no stop pending; starting delayed stop.");
+            id(stop_pump_delayed).execute();
           }
 
 text_sensor:
@@ -332,9 +369,12 @@ binary_sensor:
       - globals.set:
           id: pump_timed_out
           value: 'false'
-      - logger.log: 
+      - logger.log:
             format: "Pump timeout cleared..."
             level: INFO
+    on_release:
+      # basin just went empty; wait "Extra pump runtime" then stop the pump
+      - script.execute: stop_pump_delayed
 
 sensor:
 
