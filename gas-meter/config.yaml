@@ -1,0 +1,249 @@
+# Gas meter monitor: Elster/Honeywell AC-250 (SoCalGas), read with a
+# magnetometer on the back diaphragm cover.
+#
+# Hardware: Seeed XIAO ESP32-C6 + GY-273 magnetometer (QMC5883P, I2C 0x2C)
+# Firmware: tronikos/esphome-magnetometer-water-gas-meter (gas package)
+#
+# Symbolic name to GPIO pin map
+#  D0 =  GPIO0
+#  D1 =  GPIO1
+#  D2 =  GPIO2
+#  D3 = GPIO21   <- sensor SCL
+#  D4 = GPIO22   <- sensor SDA
+#  D5 = GPIO23
+#  D6 = GPIO16
+#  D7 = GPIO17
+#  D8 = GPIO19
+#  D9 = GPIO20
+# D10 = GPIO18
+
+substitutions:
+  # ft³ is the finest unit the package offers for gas; HA can display CCF/therms.
+  volume_unit: 'ft³'
+  i2c_sda: GPIO22  # D4
+  i2c_scl: GPIO21  # D3
+  # Set both to 'false' temporarily while calibrating / checking noise,
+  # then back to 'true' (they slow the loop down and reduce accuracy).
+  hide_magnetic_field_strength_sensors: 'true'
+  hide_half_rotations_total_sensor: 'true'
+  # The package blinks an LED as the meter turns; use the XIAO's onboard
+  # user LED (GPIO15) instead of the package default GPIO2 (= D2).
+  gpio_led: GPIO15
+
+packages:
+  meter:
+    url: https://github.com/tronikos/esphome-magnetometer-water-gas-meter
+    ref: main
+    # The GY-273 boards we have carry a QMC5883P (marked "HP 5883", I2C 0x2C).
+    # If the I2C scan in the log shows 0x0D instead, it's a QMC5883L:
+    # remove qmc5883p.yaml from this list.
+    files: [esphome-gas-meter.yaml, qmc5883p.yaml]
+    refresh: 1d
+
+esphome:
+  name: gas-meter
+  friendly_name: Gas Meter
+  # Live flow from the magnetometer waveform (see gas_live_flow.h)
+  includes:
+    - gas_live_flow.h
+  # No on_boot here on purpose: the meter package uses esphome.on_boot to
+  # speed up the main loop, and defining it here would replace that.
+
+esp32:
+  board: seeed_xiao_esp32c6
+  framework:
+    type: esp-idf
+
+web_server:
+
+api:
+  encryption:
+    key: !secret home_assistant_key
+
+ota:
+  - platform: esphome
+
+# Enable logging
+logger:
+  baud_rate: 115200
+  hardware_uart: USB_SERIAL_JTAG
+  level: info
+
+captive_portal:
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Mains powered: keep the radio awake and at full power, the meter is at
+  # the edge of Wi-Fi coverage.
+  power_save_mode: none
+  output_power: 20dB
+
+  ap:
+    ssid: "gas-meter"
+
+button:
+  - platform: restart
+    name: "Restart Device"
+
+  # Forget the learned waveform and go back to the recorded seed shape.
+  - platform: template
+    name: "Reset Live Flow Shape"
+    entity_category: config
+    icon: mdi:restore
+    on_press:
+      - lambda: live_flow::tracker().reset();
+
+text_sensor:
+  - platform: uptime
+    name: Uptime
+    update_interval: 1d
+    format:
+      separator: " "
+      days: "D"
+
+  - platform: template
+    name: "Live Flow Learning"
+    entity_category: diagnostic
+    icon: mdi:school
+    update_interval: 60s
+    lambda: |-
+      switch (live_flow::tracker().last_learn()) {
+        case 1: return {"Learned a cycle"};
+        case 2: return {"Skipped: flow not steady"};
+        case 3: return {"Skipped: cycle too fast or slow"};
+        case 4: return {"Shape differs, waiting to confirm"};
+        case 5: return {"Adopted a new shape"};
+        case 6: return {"Measuring first cycle"};
+        default: break;
+      }
+      return {"Waiting for a steady cycle"};
+
+binary_sensor:
+  - platform: status
+    name: "Connection"
+
+sensor:
+  # Reports the WiFi signal strength/RSSI in dB
+  - platform: wifi_signal
+    name: "WiFi Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+  # Z-axis log for checking the waveform and count timing in Home Assistant.
+  # Averages the raw 200 Hz readings to 2 points per second, so the main
+  # Magnetic Field Strength sensors can stay hidden. Remove when done: at
+  # 2 Hz it adds ~170k rows a day to the HA database.
+  - platform: copy
+    source_id: qmc5883l_axis_z
+    name: "Magnetic Field Z (log)"
+    id: magnetic_field_z_log
+    entity_category: "diagnostic"
+    accuracy_decimals: 1
+    filters:
+      - throttle_average: 500ms
+
+  # Live flow converted to heat input; set Heat content from your bill (see below).
+  - platform: copy
+    source_id: flow_live
+    name: "Heat Input"
+    id: heat_input
+    unit_of_measurement: "BTU/h"
+    device_class: power
+    state_class: measurement
+    icon: mdi:fire
+    accuracy_decimals: 0
+    filters:
+      - lambda: return x * 60.0f * id(heat_content).state;
+
+  # Live flow: tracks the meter's position within each cycle from the Z
+  # waveform, so it responds in seconds instead of waiting for counts.
+  # Experimental; Total and Flow are unaffected. It adapts to drift and
+  # re-learns the waveform by itself (see gas_live_flow.h).
+  - platform: copy
+    source_id: axis_value
+    id: live_flow_input
+    internal: true
+    filters:
+      - throttle_average: 500ms
+    on_value:
+      then:
+        - lambda: live_flow::tracker().update(esp_timer_get_time() / 1e6, x);
+
+  - platform: template
+    name: "Flow (live)"
+    id: flow_live
+    unit_of_measurement: "ft³/min"
+    device_class: volume_flow_rate
+    state_class: measurement
+    icon: mdi:speedometer
+    accuracy_decimals: 4
+    update_interval: 5s
+    # Publish right away on any real change, otherwise once a minute, so a
+    # steady pilot does not write a row to the HA database every 5 s.
+    filters:
+      - or:
+          - delta: 0.0003
+          - throttle: 60s
+    lambda: |-
+      if (!live_flow::tracker().ready()) return NAN;
+      return live_flow::tracker().cycles_per_s() * id(volume_per_half_rotation).state * 60.0f;
+
+  # What the live flow tracker has learned (adapts to temperature drift and
+  # re-learns the waveform from steady pilot cycles; saved across restarts).
+  - platform: template
+    name: "Live Flow Offset"
+    entity_category: diagnostic
+    unit_of_measurement: µT
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: return live_flow::tracker().offset();
+  - platform: template
+    name: "Live Flow Amplitude"
+    entity_category: diagnostic
+    unit_of_measurement: µT
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: return live_flow::tracker().amplitude();
+  - platform: template
+    name: "Live Flow Shape Updates"
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return (float) live_flow::tracker().shape_updates();
+
+# Energy per cubic foot of gas, used by Heat Input. SoCalGas prints a "billing
+# factor" (therms per CCF) on each bill: Heat content = factor x 1000, e.g.
+# 1.032 -> 1032 BTU/ft3. It drifts a percent or two month to month.
+number:
+  - platform: template
+    id: heat_content
+    name: "Heat Content"
+    unit_of_measurement: "BTU/ft³"
+    entity_category: config
+    mode: box
+    min_value: 900
+    max_value: 1200
+    step: 1
+    initial_value: 1035  # SoCalGas BTU factor 1.035 (Sep 2026 bill)
+    restore_value: true
+    optimistic: true
+
+# Antenna RF switch (FM8625H) using ESPHome 2025.12+ board aliases.
+# Both antennas go through this switch, so it must be enabled even for the
+# built-in antenna. GPIO switches (not on_boot) so we don't override the
+# meter package's on_boot.
+#   RF_SWITCH_EN  (GPIO3):  LOW = RF switch powered
+#   RF_ANT_SELECT (GPIO14): LOW = built-in ceramic antenna, HIGH = external U.FL
+switch:
+  - platform: gpio
+    id: rf_switch_enable
+    pin: RF_SWITCH_EN
+    restore_mode: ALWAYS_OFF   # LOW -> RF switch ON
+    internal: true
+  - platform: gpio
+    id: rf_antenna_select
+    pin: RF_ANT_SELECT
+    restore_mode: ALWAYS_ON    # HIGH -> external U.FL antenna (ALWAYS_OFF = built-in)
+    internal: true
