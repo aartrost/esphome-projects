@@ -12,7 +12,12 @@
 //   2. the shape itself, re-learned from each full cycle of steady flow (the
 //      water heater pilot provides one every ~11 min), timed purely from the
 //      field's own crossings so a wrong shape cannot block its own correction;
-//   3. both are saved to flash, so a restart resumes with what was learned.
+//   3. both are saved to flash (a new shape right away, offset/amplitude at
+//      most every 30 min), so a restart resumes with what was learned.
+// At faster flows the reading is taken over exactly the last full cycle once it
+// agrees with the windowed fit, which cancels the shape's small repeating
+// errors. After a large flow stops, the position coasts at the learned pilot
+// rate through the flat top/bottom instead of standing still.
 // The seed shape was recorded from the pilot on 2026-10-24.
 //
 // Phase 0 = the field rising through shape(0); one cycle = one count.
@@ -20,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #ifdef LF_DEBUG
 #include <cstdio>
 #endif
@@ -57,24 +63,32 @@ static const float SEED_OFFSET = 56.265f;
 static const float SEED_AMPLITUDE = 18.406f;
 
 // Tracking (validated offline against the pilot log and simulated burner steps).
-static const float H = 1.5f;      // uT past a peak/trough before switching branch
+// Everything below is either estimator tuning or capacity. Nothing assumes a
+// particular house, flow or meter: the noise level, sample rate, turn
+// hysteresis and which cycles are good enough to learn from are all measured.
+static const float H_SIGMAS = 5.0f;   // turn hysteresis, in measured noise sigmas
+static const int MA_MIN = 1;      // smallest moving average for turn detection (samples)
 static const float EMA = 0.8f;    // extra smoothing on the 2 Hz input
-static const float SZ = 0.3f;     // field noise after smoothing (uT)
-static const float CHI = 2.0f;    // fit-consistency limit that marks a flow change
+static const float NOISE_INIT = 0.3f;  // starting guess for the raw noise (uT), measured from then on
+static const float MIN_SAMPLES_EXT = 40;   // samples per cycle needed to measure a peak/trough
+static const float MIN_SAMPLES_NOISE = 200; // samples per cycle below which the signal barely moves between samples
+#ifndef LF_CHI
+#define LF_CHI 2.0f
+#endif
+static const float CHI = LF_CHI;    // fit-consistency limit that marks a flow change
 static const float MINW = 0.15f;  // a window must be this full before it is used
 static const int NW = 7;
 static const float WINS[NW] = {5, 10, 20, 40, 80, 160, 320};  // seconds
-static const int HMAX = 700;      // > 320 s at 2 Hz
+static const int HMAX = 700;
+static const double CYCLE_LOCK_AGREE = 0.08;  // last-cycle estimate is used while it agrees with the fit this closely      // > 320 s at 2 Hz
 
 // Adaptation.
-static const float SLOW_CYCLE_S = 60;     // learn offset/amplitude only from cycles slower than this
 static const float EXT_ALPHA = 0.5f;      // weight of each new peak/trough pair
-static const float LEARN_MIN_S = 200;     // learn shape only from cycles this slow ...
-static const float LEARN_MAX_S = 2400;    // ... and no slower (recording buffer size)
-static const float STEADY_TOL = 0.03f;    // consecutive cycles must agree this closely
+static const float STEADY_TOL = 0.03f;    // consecutive cycles must agree this closely (or the timing resolution)
+static const float BIN_FILL = 1.0f;       // samples per shape bin before a learned shape is used
 static const float SHAPE_BETA = 0.25f;    // weight of each accepted cycle
 static const float SHAPE_BIG = 0.25f;     // RMS change that counts as "different"
-static const int REC_MAX = 2500;          // 1 Hz recording of one cycle
+static const int REC_MAX = 2500;          // samples of one cycle (thinned out if a cycle is longer)
 static const uint32_t MAGIC = 0x4C46310Bu;
 static const double SAVE_EVERY_S = 1800;  // flash writes at most every 30 min
 
@@ -96,6 +110,18 @@ class Tracker {
     double dt = t - tp_;
     tp_ = t;
     if (dt <= 0) return true;
+    dt_avg_ += 0.01 * (dt - dt_avg_);
+    // Noise: second differences of the raw input, but only while the meter is
+    // slow enough that the waveform itself does not curve between samples.
+    if (r_ * dt_avg_ * MIN_SAMPLES_NOISE <= 1.0 && n2_ >= 2) {
+      double d2 = z - 2 * z1_ + z2_;
+      nvar_ += 0.01 * (d2 * d2 / 6.0 - nvar_);
+      if (nvar_ < 1e-4) nvar_ = 1e-4;
+    }
+    z2_ = z1_; z1_ = z; if (n2_ < 2) n2_++;
+    sz_ = std::sqrt(nvar_ * EMA / (2 - EMA));          // after the EMA below
+    H_ = H_SIGMAS * sz_;
+    if (H_ > 0.15f * amp_ * (smax_ - smin_)) H_ = 0.15f * amp_ * (smax_ - smin_);
     zf_ += EMA * (z - zf_);
     ring_[ri_] = zf_;
     ri_ = (ri_ + 1) % RING;
@@ -108,10 +134,10 @@ class Tracker {
     float umid = off_ + amp_ * (smax_ + smin_) / 2;
     if (rising_) {
       if (zx > ext_) ext_ = zx;
-      if (zx < ext_ - H && ext_ > umid) { on_extreme_(true, ext_, t); rising_ = false; ext_ = zx; }
+      if (zx < ext_ - H_ && ext_ > umid) { on_extreme_(true, ext_, t); rising_ = false; ext_ = zx; }
     } else {
       if (zx < ext_) ext_ = zx;
-      if (zx > ext_ + H && ext_ < umid) { on_extreme_(false, ext_, t); rising_ = true; ext_ = zx; }
+      if (zx > ext_ + H_ && ext_ < umid) { on_extreme_(false, ext_, t); rising_ = true; ext_ = zx; }
     }
 
     // Reference-level crossings (alternating up/down) time each cycle for shape
@@ -126,11 +152,15 @@ class Tracker {
       last_up_ = false;
     }
     zxprev_ = zx;
-    if (rec_on_ && (t - rec_last_) >= 1.0 && rec_n_ < REC_MAX) {
+    if (rec_on_ && ++rec_skip_ >= rec_step_) {
+      rec_skip_ = 0;
+      if (rec_n_ == REC_MAX) {             // long cycle: keep every other sample and halve the rate
+        for (int k = 0; k < REC_MAX / 2; k++) { rec_t_[k] = rec_t_[2*k]; rec_z_[k] = rec_z_[2*k]; }
+        rec_n_ = REC_MAX / 2; rec_step_ *= 2;
+      }
       rec_t_[rec_n_] = (float) (t - rec_t0_);
       rec_z_[rec_n_] = zx;  // same signal as the crossings, so the phase reference holds still
       rec_n_++;
-      rec_last_ = t;
     }
 
     // Position within the cycle on the current branch, forward only.
@@ -138,9 +168,15 @@ class Tracker {
     double c = base + std::floor(phi_ - base);
     if (c < phi_ - 0.02) c += 1;
     if (c - phi_ > 0.5) c -= 1;
-    if ((rising_ && zf_ > zmax_() - H) || (!rising_ && zf_ < zmin_() + H)) {
+    // "Flat": near the top/bottom of the model, or already turning back from
+    // a peak/trough that the turn detector has not confirmed yet. Either way
+    // the field cannot say where in the turn the meter is.
+    bool turning = rising_ ? (ext_ > umid && ext_ - zx > 0.5f * H_) : (ext_ < umid && zx - ext_ > 0.5f * H_);
+    bool flat = (rising_ && zf_ > zmax_() - H_) || (!rising_ && zf_ < zmin_() + H_) || turning;
+    double lim = 0;
+    if (flat) {
       // Flat top/bottom: coast at the current rate, never past the turning point.
-      double lim = rising_ ? pmax_ : pmin_;
+      lim = rising_ ? pmax_ : pmin_;
       lim += std::floor(phi_ - lim);
       if (lim < phi_ - 0.02) lim += 1;
       double coast = phi_ + r_ * dt;
@@ -149,29 +185,57 @@ class Tracker {
     }
     if (c > phi_) phi_ = c;
 
-    double p = phi_ - std::floor(phi_);
-    float dzdp = amp_ * std::fabs(sh_(p + 0.004) - sh_(p - 0.004)) / 0.008f;
-    float sp = SZ / (dzdp > 1e-3f ? dzdp : 1e-3f);
-    push_(t, phi_, sp);
+    flat_now_ = flat;
+    if (flat) {
+      // Here the field says only that the meter is somewhere in the flat
+      // stretch around the turn, not where: give the fit the middle of the
+      // stretch with the uncertainty of anywhere inside it.
+      double da, db;
+      flat_span_(rising_, da, db);
+      p_exit_ = lim + db;
+      push_(t, lim + (da + db) / 2, (float) ((db - da) / std::sqrt(12.0)), false);
+    } else {
+      double p = phi_ - std::floor(phi_);
+      float dzdp = amp_ * std::fabs(sh_(p + 0.004) - sh_(p - 0.004)) / 0.008f;
+      push_(t, phi_, sz_ / (dzdp > 1e-3f ? dzdp : 1e-3f), true);
+      t_inf_ = t; p_inf_ = phi_; r_inf_ = r_;
+    }
     fit_(t);
-    if (dirty_ && (t - last_save_) >= SAVE_EVERY_S) save_(t);
+    // Save a newly learned shape right away (at most once per pilot cycle,
+    // ~11 min); offset/amplitude-only changes at most every SAVE_EVERY_S.
+    if (dirty_ && (save_now_ || (t - last_save_) >= SAVE_EVERY_S)) { save_(t); save_now_ = false; }
     return true;
   }
 
   bool ready() const { return started_; }
-  double cycles_per_s() const { return r_; }
+  double cycles_per_s() const { return r_out_; }
   double phase() const { return phi_; }  // unwrapped, in counts
   float offset() const { return off_; }
   float amplitude() const { return amp_; }
   uint32_t shape_updates() const { return updates_; }
   int last_learn() const { return last_learn_; }  // see LearnResult
 
-  enum LearnResult { NONE = 0, ACCEPTED = 1, NOT_STEADY = 2, OUT_OF_RANGE = 3, DIFFERENT_WAITING = 4, ACCEPTED_NEW_SHAPE = 5, FIRST_CYCLE = 6 };
+  enum LearnResult { NONE = 0, ACCEPTED = 1, NOT_STEADY = 2, OUT_OF_RANGE = 3, DIFFERENT_WAITING = 4, ACCEPTED_NEW_SHAPE = 5, FIRST_CYCLE = 6, COLLECTING = 7, RECALIBRATED = 8 };
+  float noise() const { return std::sqrt(nvar_); }   // measured raw field noise (uT)
+
+  // After the meter package recalibrates: take the new range of the field, and
+  // start tracking afresh. Same axis: keep the learned shape. New axis: the
+  // shape is unknown, so start from the seed and re-learn it.
+  void recalibrate(float zmin, float zmax, bool new_axis, float span_ratio) {
+    if (new_axis) seed_();
+    amp_ = span_ratio * (zmax - zmin) / (smax_ - smin_);
+    off_ = (zmax + zmin) / 2 - amp_ * (smax_ + smin_) / 2;
+    started_ = false; n0_ = 0; rec_on_ = false; hn_ = 0; hs_ = 0; r_ = 0; r_out_ = 0;
+    have_pk_ = have_tr_ = false; prev_period_ = 0; prev_split_ = 0; diff_count_ = 0;
+    acc_reset_();
+    last_learn_ = RECALIBRATED;
+    dirty_ = true; save_now_ = true;
+  }
 
   // Forget everything learned and go back to the recorded seed shape.
   void reset() {
     seed_();
-    started_ = false; n0_ = 0; rec_on_ = false; hn_ = 0; hs_ = 0; r_ = 0;
+    started_ = false; n0_ = 0; rec_on_ = false; hn_ = 0; hs_ = 0; r_ = 0; r_out_ = 0;
     have_pk_ = have_tr_ = false; prev_period_ = 0; prev_split_ = 0; diff_count_ = 0;
     dirty_ = true; last_save_ = -1e9;
 #ifdef LIVE_FLOW_PERSIST
@@ -193,6 +257,7 @@ class Tracker {
     std::memcpy(shape_, SEED_SHAPE, sizeof(shape_));
     off_ = SEED_OFFSET; amp_ = SEED_AMPLITUDE; updates_ = 0;
     build_();
+    acc_reset_();
   }
   float sh_(double p) const {
     double x = (p - std::floor(p)) * N;
@@ -203,6 +268,17 @@ class Tracker {
     return (float) (shape_[i] * (1 - f) + shape_[j] * f);
   }
   float zmax_() const { return off_ + amp_ * smax_; }
+  // Phase offsets (cycles) before and after a turn within which the field
+  // stays inside the turn hysteresis, from the current shape.
+  void flat_span_(bool peak, double &da, double &db) const {
+    int i0 = 0;
+    for (int i = 1; i < N; i++) if (peak ? shape_[i] > shape_[i0] : shape_[i] < shape_[i0]) i0 = i;
+    float thr = H_ / amp_;
+    int a = 1, b = 1;
+    while (a < N / 2 && std::fabs(shape_[(i0 - a + N) % N] - shape_[i0]) < thr) a++;
+    while (b < N / 2 && std::fabs(shape_[(i0 + b) % N] - shape_[i0]) < thr) b++;
+    da = -(double) a / N; db = (double) b / N;
+  }
   float zmin_() const { return off_ + amp_ * smin_; }
   void build_() {
     int imax = 0, imin = 0;
@@ -267,18 +343,29 @@ class Tracker {
   bool rising_ = true;
   float zf_ = 0, ext_ = 0, zxprev_ = 0;
   bool last_up_ = false;
-  double tp_ = 0, phi_ = 0, r_ = 0;
+  double tp_ = 0, phi_ = 0, r_ = 0, r_out_ = 0;
+  double dt_avg_ = 0.5, nvar_ = NOISE_INIT * NOISE_INIT, z1_ = 0, z2_ = 0;
+  int n2_ = 0;
+  float sz_ = 0.3f, H_ = 1.5f;
+  bool flat_now_ = false;
+  double t_inf_ = 0, p_inf_ = 0, r_inf_ = 0, p_exit_ = 0;
   static const int RING = 30;  // 15 s at 2 Hz
   float ring_[RING];
   int ri_ = 0, rn_ = 0;
   // Peaks/troughs are taken from a moving average sized to the cycle so noise
   // does not inflate them; a few seconds at pilot speed.
-  float smoothed_() const {
+  int m_cur_ = MA_MIN;
+  float smoothed_() {
     double period = r_ > 1e-6 ? 1.0 / r_ : 1e9;
     int m = (int) (period / 40.0 * 2.0);
-    if (m < 1) m = 1;
-    if (m > rn_) m = rn_;
+    if (m < MA_MIN) m = MA_MIN;
     if (m > RING) m = RING;
+    // Shrink at once, but grow by one sample at a time: a sudden longer window
+    // would pull older samples back in and make the average jump, which looked
+    // like a peak or trough when a big flow stopped.
+    if (m < m_cur_) m_cur_ = m; else if (m > m_cur_) m_cur_++;
+    m = m_cur_;
+    if (m > rn_) m = rn_;
     double s = 0;
     for (int k = 1; k <= m; k++) s += ring_[(ri_ - k + RING) % RING];
     return (float) (s / m);
@@ -288,7 +375,7 @@ class Tracker {
   double t_pk_ = 0, t_tr_ = 0, r_pk_ = 0, r_tr_ = 0;
   void on_extreme_(bool peak, float value, double t) {
     double period = r_ > 1e-6 ? 1.0 / r_ : 1e9;
-    bool slow = period > SLOW_CYCLE_S && period < 1e8;
+    bool slow = period > MIN_SAMPLES_EXT * dt_avg_ && period < 1e8;   // enough samples to see the turn
     if (peak) { pk_ = value; have_pk_ = slow; t_pk_ = t; r_pk_ = r_; }
     else      { tr_ = value; have_tr_ = slow; t_tr_ = t; r_tr_ = r_; }
     if (!(have_pk_ && have_tr_)) return;
@@ -313,37 +400,44 @@ class Tracker {
 
   // ---- shape learning ----------------------------------------------------
   bool rec_on_ = false;
-  double rec_t0_ = 0, rec_last_ = 0, rec_fall_ = -1;
-  int rec_n_ = 0;
+  double rec_t0_ = 0, rec_fall_ = -1;
+  int rec_n_ = 0, rec_step_ = 1, rec_skip_ = 0;
   float rec_t_[REC_MAX], rec_z_[REC_MAX];
   float prev_period_ = 0, prev_split_ = 0;
   int diff_count_ = 0, last_learn_ = NONE;
   void on_cross_(double tc, bool up) {
     if (!up) { if (rec_on_ && rec_fall_ < 0) rec_fall_ = tc - rec_t0_; return; }
     if (rec_on_) finish_cycle_(tc);
-    rec_on_ = true; rec_t0_ = tc; rec_last_ = tc - 1; rec_n_ = 0; rec_fall_ = -1;
+    rec_on_ = true; rec_t0_ = tc; rec_n_ = 0; rec_fall_ = -1; rec_step_ = 1; rec_skip_ = 0;
   }
+  // Shape samples from consecutive steady cycles, folded onto one cycle. A slow
+  // cycle fills every bin on its own; a fast one only has a few samples, so
+  // several steady cycles are combined until every bin has data.
+  float acc_sum_[N], acc_cnt_[N];
+  int acc_cycles_ = 0;
+  void acc_reset_() { for (int i = 0; i < N; i++) { acc_sum_[i] = 0; acc_cnt_[i] = 0; } acc_cycles_ = 0; }
   void finish_cycle_(double tc) {
     float period = (float) (tc - rec_t0_);
     float split = rec_fall_ > 0 ? (float) rec_fall_ / period : -1;
+    // "Steady": same period and same rise/fall split as the previous cycle, to
+    // within 3% or the timing resolution of the samples, whichever is larger.
+    float tol = std::max(STEADY_TOL, (float) (2 * dt_avg_ / period));
     bool steady = prev_period_ > 0 && split > 0 && prev_split_ > 0 &&
-                  std::fabs(period / prev_period_ - 1) < STEADY_TOL &&
-                  std::fabs(split - prev_split_) < STEADY_TOL;
-    bool range = period >= LEARN_MIN_S && period <= LEARN_MAX_S && rec_n_ >= N;
+                  std::fabs(period / prev_period_ - 1) < tol &&
+                  std::fabs(split - prev_split_) < tol;
+    bool range = rec_n_ >= 8;          // at least a handful of samples in the cycle
     bool first = prev_period_ <= 0;
     prev_period_ = period; prev_split_ = split;
 #ifdef LF_DEBUG
-    fprintf(stderr, "t=%.0f CYCLE period=%.1f split=%.3f steady=%d range=%d n=%d\n", tc, period, split, steady, range, rec_n_);
+    fprintf(stderr, "t=%.0f CYCLE period=%.1f split=%.3f steady=%d n=%d acc=%d\n", tc, period, split, steady, rec_n_, acc_cycles_);
 #endif
-    if (!range) { last_learn_ = OUT_OF_RANGE; return; }
-    if (first) { last_learn_ = FIRST_CYCLE; return; }  // nothing to compare with yet
-    if (!steady) { last_learn_ = NOT_STEADY; return; }
-    // Average the recording into N phase bins (time is proportional to volume).
+    if (!range) { acc_reset_(); last_learn_ = OUT_OF_RANGE; return; }
+    if (first) { acc_reset_(); last_learn_ = FIRST_CYCLE; return; }  // nothing to compare with yet
+    if (!steady) { acc_reset_(); last_learn_ = NOT_STEADY; return; }
+    // Fold this cycle onto the accumulated one (time is proportional to volume).
     // Shape index i is phase i/N, so each sample is shared between the two
     // nearest indices (plain bucketing would shift the shape half a bin per
     // update and walk it around the cycle).
-    float sum[N], cnt[N];
-    for (int i = 0; i < N; i++) { sum[i] = 0; cnt[i] = 0; }
     for (int k = 0; k < rec_n_; k++) {
       float x = rec_t_[k] / period * N;
       if (x < 0 || x >= N) continue;
@@ -351,14 +445,16 @@ class Tracker {
       float f = x - i0;
       int i1 = (i0 + 1) % N;
       float u = (rec_z_[k] - off_) / amp_;
-      sum[i0] += (1 - f) * u; cnt[i0] += 1 - f;
-      sum[i1] += f * u; cnt[i1] += f;
+      acc_sum_[i0] += (1 - f) * u; acc_cnt_[i0] += 1 - f;
+      acc_sum_[i1] += f * u; acc_cnt_[i1] += f;
     }
+    acc_cycles_++;
     float nw[N];
     for (int i = 0; i < N; i++) {
-      if (cnt[i] < 0.3f) { last_learn_ = OUT_OF_RANGE; return; }
-      nw[i] = sum[i] / cnt[i];
+      if (acc_cnt_[i] < BIN_FILL) { last_learn_ = COLLECTING; return; }
+      nw[i] = acc_sum_[i] / acc_cnt_[i];
     }
+    acc_reset_();
     float sm[N];
     for (int i = 0; i < N; i++) {
       float s = 0;
@@ -389,6 +485,7 @@ class Tracker {
     off_ += amp_ * mid; amp_ *= half;
     build_();
     updates_++;
+    save_now_ = true;
 #ifdef LF_DEBUG
     fprintf(stderr, "LEARN %u rms=%.3f s0=%.3f pmax=%.3f pmin=%.3f off=%.2f amp=%.2f shape:", (unsigned) updates_, rms, shape_[0], pmax_, pmin_, off_, amp_);
     for (int i = 0; i < N; i += 8) fprintf(stderr, " %.2f", shape_[i]);
@@ -398,13 +495,13 @@ class Tracker {
   }
 
   // ---- flow fit ----------------------------------------------------------
-  struct Pt { double t, phi; float s; };
+  struct Pt { double t, phi; float s; bool inf; };   // inf: the field gave a position
   Pt h_[HMAX];
   int hs_ = 0, hn_ = 0;
-  void push_(double t, double phi, float s) {
+  void push_(double t, double phi, float s, bool inf) {
     while (hn_ > 0 && h_[hs_].t < t - WINS[NW - 1]) { hs_ = (hs_ + 1) % HMAX; hn_--; }
     if (hn_ == HMAX) { hs_ = (hs_ + 1) % HMAX; hn_--; }
-    h_[(hs_ + hn_) % HMAX] = {t, phi, s};
+    h_[(hs_ + hn_) % HMAX] = {t, phi, s, inf};
     hn_++;
   }
   // Longest window over which a straight line (constant flow) still fits. One
@@ -413,7 +510,7 @@ class Tracker {
   void fit_(double t) {
     bool have = false;
     double rsel = 0, sw = 0, st = 0, sp2 = 0, stt = 0, stp = 0, spp = 0, tfirst = t;
-    int n = 0, k = 0;
+    int n = 0, k = 0, n_inf = 0, sel_inf = 0;
     for (int i = hn_ - 1; i >= -1 && k < NW; i--) {
       bool end = (i < 0) || (h_[(hs_ + i) % HMAX].t < t - WINS[k]);
       while (end && k < NW) {
@@ -426,6 +523,7 @@ class Tracker {
             if (have && c2 > CHI) { k = NW; break; }
             rsel = rr > 0 ? rr : 0;
             have = true;
+            sel_inf = n_inf;
           }
         }
         k++;
@@ -436,13 +534,56 @@ class Tracker {
       double w = 1.0 / ((double) q.s * q.s), tt = q.t - t, pp = q.phi - phi_;
       sw += w; st += w * tt; sp2 += w * pp; stt += w * tt * tt; stp += w * tt * pp; spp += w * pp * pp;
       n++;
+      if (q.inf) n_inf++;
       tfirst = q.t;
     }
     if (have) r_ = rsel;
+    // If the chosen window holds nothing but flat-stretch samples (typically
+    // right after a big flow stopped near a turn), the fit has no information.
+    // What is known: the meter has not left the stretch since the last real
+    // position. With no other assumption, the rate is anywhere from zero up to
+    // what would just have reached the end of the stretch; report the middle
+    // of that range (never more than the rate before). It converges as soon as
+    // the field moves again.
+    if (flat_now_ && have && sel_inf == 0 && t > t_inf_) {
+      double r_hi = (p_exit_ - p_inf_) / (t - t_inf_);
+      double r_mid = 0.5 * (r_hi > 0 ? r_hi : 0);
+      r_ = r_mid < r_inf_ ? r_mid : r_inf_;
+    }
+    // Cycle-locked estimate: the time the meter took for its last full cycle.
+    // The shape's small errors repeat every cycle, so they cancel over exactly
+    // one cycle; this removes the ripple at higher flows. Used only while it
+    // agrees with the windowed fit (i.e. the flow is steady) and the cycle is
+    // short enough to be recent.
+    r_out_ = r_;
+    double target = phi_ - 1.0;
+    for (int i = hn_ - 1; i > 0; i--) {
+      const Pt &a = h_[(hs_ + i - 1) % HMAX], &b = h_[(hs_ + i) % HMAX];
+      if (a.phi <= target && b.phi >= target) {
+        double tc = (b.phi > a.phi) ? a.t + (target - a.phi) / (b.phi - a.phi) * (b.t - a.t) : b.t;
+        double span = t - tc;
+        if (span > 0 && span <= WINS[NW - 1]) {
+          // weighted straight-line fit over exactly that last cycle
+          double sw = 0, st = 0, sp = 0, stt = 0, stp = 0;
+          for (int j = i; j < hn_; j++) {
+            const Pt &q = h_[(hs_ + j) % HMAX];
+            double w = 1.0 / ((double) q.s * q.s), tt = q.t - t, pp = q.phi - phi_;
+            sw += w; st += w * tt; sp += w * pp; stt += w * tt * tt; stp += w * tt * pp;
+          }
+          double den = stt - st * st / sw;
+          if (den > 0) {
+            double rc = (stp - st * sp / sw) / den;
+            if (rc > 0 && r_ > 0 && std::fabs(rc / r_ - 1) < CYCLE_LOCK_AGREE) r_out_ = rc;
+          }
+        }
+        break;
+      }
+      if (a.phi < target) break;
+    }
   }
 
   // ---- persistence -------------------------------------------------------
-  bool loaded_ = false, dirty_ = false;
+  bool loaded_ = false, dirty_ = false, save_now_ = false;
   double last_save_ = -1e9;
 #ifdef LIVE_FLOW_PERSIST
   esphome::ESPPreferenceObject pref_;

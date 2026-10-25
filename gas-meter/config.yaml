@@ -114,6 +114,8 @@ text_sensor:
         case 4: return {"Shape differs, waiting to confirm"};
         case 5: return {"Adopted a new shape"};
         case 6: return {"Measuring first cycle"};
+        case 7: return {"Collecting steady cycles"};
+        case 8: return {"Recalibrated, re-learning"};
         default: break;
       }
       return {"Waiting for a steady cycle"};
@@ -123,6 +125,9 @@ binary_sensor:
     name: "Connection"
 
 sensor:
+  # The meter package's count-based Flow is replaced by "Flow (live)".
+  - id: !remove sensor_flow
+
   # Reports the WiFi signal strength/RSSI in dB
   - platform: wifi_signal
     name: "WiFi Signal dB"
@@ -168,7 +173,45 @@ sensor:
       - throttle_average: 500ms
     on_value:
       then:
-        - lambda: live_flow::tracker().update(esp_timer_get_time() / 1e6, x);
+        - lambda: |-
+            // Follow the meter package's "Calibrate axis": when a calibration
+            // finishes, hand the new field range (and whether the axis
+            // changed) to the live flow tracker so it starts afresh.
+            static bool was_cal = false;
+            static int old_axis = -1;
+            static float old_span = 0, old_amp = 0;
+            // axis as 0/1/2 (x/y/z), compared the same way the meter package does
+            auto axis_idx = []() -> int {
+              if (id(axis).current_option() == "x") return 0;
+              if (id(axis).current_option() == "y") return 1;
+              if (id(axis).current_option() == "z") return 2;
+              return -1;
+            };
+            bool cal = id(calibrating);
+            if (cal && !was_cal) {
+              old_axis = axis_idx();
+              old_span = id(magnet_span).state;
+              old_amp = live_flow::tracker().amplitude();
+            }
+            if (!cal && was_cal) {
+              int ax = axis_idx();
+              float lo = NAN, hi = NAN;
+              if (ax == 0) { lo = id(calibrating_axis_x_min); hi = id(calibrating_axis_x_max); }
+              if (ax == 1) { lo = id(calibrating_axis_y_min); hi = id(calibrating_axis_y_max); }
+              if (ax == 2) { lo = id(calibrating_axis_z_min); hi = id(calibrating_axis_z_max); }
+              if (std::isfinite(lo) && std::isfinite(hi) && hi - lo >= id(calibration_minimal_axis_range).state) {
+                bool new_axis = ax != old_axis;
+                // The calibration sees raw extremes, which noise widens; scale by
+                // how the tracker's own amplitude related to the last calibration.
+                float ratio = (!new_axis && old_span > 0 && old_amp > 0) ? 2 * old_amp / old_span : 1.0f;
+                if (ratio < 0.7f) ratio = 0.7f;
+                if (ratio > 1.1f) ratio = 1.1f;
+                live_flow::tracker().recalibrate(lo, hi, new_axis, ratio);
+                ESP_LOGI("live_flow", "Recalibrated: axis %c%s, range %.1f..%.1f uT", "xyz"[ax], new_axis ? " (new)" : "", lo, hi);
+              }
+            }
+            was_cal = cal;
+            live_flow::tracker().update(esp_timer_get_time() / 1e6, x);
 
   - platform: template
     name: "Flow (live)"
@@ -189,8 +232,9 @@ sensor:
       if (!live_flow::tracker().ready()) return NAN;
       return live_flow::tracker().cycles_per_s() * id(volume_per_half_rotation).state * 60.0f;
 
-  # What the live flow tracker has learned (adapts to temperature drift and
-  # re-learns the waveform from steady pilot cycles; saved across restarts).
+  # What the live flow tracker has learned: offset/amplitude follow drift, the
+  # waveform is re-learned from any steady flow, the noise level is measured
+  # (and sets the turn hysteresis). Saved across restarts.
   - platform: template
     name: "Live Flow Offset"
     entity_category: diagnostic
@@ -205,6 +249,13 @@ sensor:
     accuracy_decimals: 2
     update_interval: 60s
     lambda: return live_flow::tracker().amplitude();
+  - platform: template
+    name: "Live Flow Noise"
+    entity_category: diagnostic
+    unit_of_measurement: µT
+    accuracy_decimals: 3
+    update_interval: 60s
+    lambda: return live_flow::tracker().noise();
   - platform: template
     name: "Live Flow Shape Updates"
     entity_category: diagnostic

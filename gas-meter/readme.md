@@ -67,9 +67,10 @@ Add the total sensor to the Energy dashboard as a gas source (ft³).
 
 ## Live flow (experimental)
 
-`Flow` waits for whole counts, so it lags by minutes at low flow. `Flow (live)`
-reads the meter's position *within* each cycle from the Z waveform instead and
-responds in seconds (code in `gas_live_flow.h`):
+The meter package's count-based `Flow` waited for whole counts and lagged by
+minutes at low flow, so it is removed. `Flow (live)` reads the meter's position
+*within* each cycle from the Z waveform instead and responds in seconds (code
+in `gas_live_flow.h`); `Heat Input` follows it:
 
 - A diaphragm meter is positive displacement, so the field depends only on how
   far the mechanism has turned. One cycle of the waveform (recorded from the
@@ -77,14 +78,18 @@ responds in seconds (code in `gas_live_flow.h`):
   is the slope of that position, fitted with steep parts of the waveform
   weighted most.
 - It adapts by itself: offset and amplitude follow each peak and trough
-  (temperature drift), and the shape is re-learned from every steady pilot
-  cycle (~11 min). What it learned is saved across restarts and shown in the
-  `Live Flow Offset`, `Live Flow Amplitude`, `Live Flow Shape Updates` and
-  `Live Flow Learning` diagnostics.
+  (temperature drift), the shape is re-learned from any steady flow, and the
+  noise level is measured (it sets the turn hysteresis). What it learned is
+  saved across restarts and shown in the `Live Flow Offset`, `Live Flow
+  Amplitude`, `Live Flow Noise`, `Live Flow Shape Updates` and `Live Flow
+  Learning` diagnostics.
+- `Calibrate axis` also recalibrates it: it takes the new field range and
+  starts tracking afresh (keeping the learned shape if the axis stays the same,
+  re-learning it if the axis changes).
 - A clearly different shape (for example after moving the case) is only
   adopted once it repeats; `Reset Live Flow Shape` goes back to the recorded
   seed.
-- `Total` and `Flow` are unaffected; `Total` remains the accurate long-term number.
+- `Total` (from the counts) is unaffected and remains the accurate long-term number.
 
 ## Wi-Fi / antenna
 
@@ -98,10 +103,16 @@ Check **WiFi Signal dB** at the meter; better than about -75 dBm is fine.
 
 `case/gas_meter_case.scad` is parametric (OpenSCAD). The sensor sits chip-side
 down on a 0.6mm membrane in the back (press-fit on two pegs + hot glue), the XIAO
-lies flat under the lid on four corner tabs, ~12.6mm above the sensor chip.
+lies flat on four corner tabs, ~12.6mm above the sensor chip. Mount it with the
+power cable pointing down; the antenna then screws on pointing up.
 
- - `case/base.stl`, `case/lid.stl`: print the base back-face down, the lid face down
- - `case/fit_test.stl`: quick print to check the PCB pockets, screw posts and cable hole
+ - `case/base.stl`: print back-face down
+ - `case/lid_cap.stl`: tall lid with the antenna's RP-SMA bulkhead in the upward-facing
+   (USB) end, room for the pigtail coil, and deep screw pockets (11.5 mm self-tapping
+   screws); print roof down, no supports
+ - `case/lid_plugs.stl`: four plugs for the screw pockets (top down; PETG or TPU)
+ - `case/lid_cap_connector_test.stl`, `case/lid_plug_fit_test.stl`: quick prints to check
+   the connector hole/hex pocket and the plug fit (1/2/3 dots = 0.0/0.1/0.2 mm) first
  - Waterproofing: Plasti Dip (white/grey) on the outside, masking the back face and the
    lid fit surfaces; neutral-cure silicone (GE Silicone 2) on the lid joint, cable entry
    and screw heads; liquid electrical tape or conformal coating on the solder joints;
