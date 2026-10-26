@@ -9,7 +9,7 @@ Nothing touches the meter except double-sided tape.
 ## Hardware
 
   - Seeed Studio XIAO ESP32C6 (no headers)
-  - GY-273 magnetometer board (QMC5883P, I2C address 0x2C)
+  - [GY-273 magnetometer board](https://www.amazon.com/dp/B0CD77DN87) (QMC5883P, I2C address 0x2C)
   - 26-30AWG silicone hookup wire
   - USB cable (cut) + 5V USB power supply
   - 4x self-tapping screws, ~2mm thread, 11.5mm, 3.5mm round head
