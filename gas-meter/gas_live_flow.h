@@ -102,6 +102,7 @@ static const double RATE_CHECK_S = 20.0;        // the measured phase advance ov
 #define LF_RCK 4.0
 #endif
 static const double RATE_CHECK_K = LF_RCK;         // ...and the rate freed when they disagree by this many sigmas
+static const double NEAR_EXT = 2.0;                // readings closer than this many turn hysteresis widths to the last extreme count as "near it"
 static const double OUTLIER_K = 1.5;               // a lone reading this many half-spans from the centre is a glitch...
 static const double GLITCH_SIGMAS = 3.0;           // ...as is one this many sigmas from where the model expects it
 static const double GLITCH_RATE_TOL = 0.05;        // the rate may be off by this fraction between two readings
@@ -160,6 +161,7 @@ class Tracker {
   float noise() const { return std::sqrt((float) nvar_); }
 #ifdef LF_DEBUG
   double dbg_rm = 0, dbg_sr = 0; int dbg_rc = 0;
+  bool dbg_was_flat = false, dbg_flat_exit = false; double dbg_flat_t0 = 0, dbg_flat_phi0 = 0, dbg_hi_over = 0; int dbg_flat_wind = 0, dbg_flat_n = 0;
   double dbg_nis = 0; int dbg_reacq = 0; double dbg_sig_r = 0; int dbg_pm = 0; int dbg_rising = 0; double dbg_ext = 0, dbg_H = 0, dbg_zx = 0;
 #endif
 
@@ -309,7 +311,7 @@ class Tracker {
     r_ = 0; init_cov_();
     P_[1][1] = 1e-3 * 1e-3;   // rate unknown but small: it will be measured in seconds
     tp_ = t; started_ = true; rn_ = 0; nis_ema_ = 0;
-    t_inf_ = -1e9; p_inf_ = 0; dz_avg_ = 0; n2_ = 0; in_run_ = 10; have_turn_ = false; out_frac_ = 0; lost_ = false;
+    t_inf_ = -1e9; p_inf_ = 0; dz_avg_ = 0; n2_ = 0; in_run_ = 10; have_turn_ = false; prev_disagree_ = false; out_n_ = 0; out_frac_ = 0; lost_ = false;
     ring_push_(t);
     last_cross_ = std::floor(phi_);
     return false;
@@ -486,9 +488,15 @@ class Tracker {
     // on either branch then.
     bool turning = rising_ ? (ext_ > umid && ext_ - zx > 0.5 * H) : (ext_ < umid && zx - ext_ > 0.5 * H);
     bool flat = (rising_ ? (z > zmax - H) : (z < zmin + H)) || turning;
+#ifdef LF_DEBUG
+    if (flat && !dbg_was_flat) { dbg_flat_t0 = t; dbg_flat_phi0 = phi_; dbg_flat_wind = 0; dbg_flat_n = 0; }
+    if (flat) dbg_flat_n++;
+    dbg_flat_exit = !flat && dbg_was_flat;
+    dbg_was_flat = flat;
+#endif
     int n_meas = 0;
     double Hm[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, nu[3] = {0, 0, 0}, Rm[3] = {1, 1, 1};
-    bool gated = false;
+    bool gated = false, near_ext = false;
     if (turned && real_ext && period > 40 * dt_avg_) {
       // A confirmed turn of a cycle with enough samples to catch the extreme:
       // its extreme (the peak or trough of the smoothed field) measures the
@@ -527,6 +535,9 @@ class Tracker {
         Hm[n_meas][2] = 1; Hm[n_meas][3] = sext; nu[n_meas] = z - zext; Rm[n_meas] = sig * sig + H * H / 9;
         n_meas++;
       }
+#ifdef LF_DEBUG
+      dbg_hi_over = phi_ - hi;
+#endif
       if (phi_ > hi || phi_ < lo) {
         Hm[n_meas][0] = 1; nu[n_meas] = (phi_ > hi ? hi : lo) - phi_; Rm[n_meas] = sf * sf;
         n_meas++;
@@ -539,6 +550,9 @@ class Tracker {
       if (phi_ > hi && t > t_inf_ && hi > p_inf_) {
         double r_mid = 0.5 * (hi - p_inf_) / (t - t_inf_);
         if (r_ > r_mid) {
+#ifdef LF_DEBUG
+          dbg_flat_wind++;
+#endif
           r_ = r_mid;
           if (P_[1][1] > r_mid * r_mid) {   // shrink the rate's covariance with its cross-term, or P goes indefinite
             double sc = r_mid * r_mid / P_[1][1];
@@ -554,12 +568,25 @@ class Tracker {
       double y = phase_(z, rising_);
       y += std::floor(phi_ - y);
       if (y < phi_ - 0.5) y += 1;
+      // A reading still close to the extreme just passed sits where the wave
+      // is nearly flat: its position is poorly determined and easily biased
+      // by a little shape error. One such reading on its own is not evidence
+      // of a flow change (at fast flow the first reading after every turn is
+      // one), so it may only trip the gate if the last well-determined reading
+      // already disagreed. A meter that stopped or stepped keeps disagreeing.
+      // Only at fast flow, judged by the field's step between readings: at
+      // pilot speed a reading near the extreme moves the prediction little.
+      near_ext = dz_avg_ > 0.5 * H && (rising_ ? (z < zmin + NEAR_EXT * H) : (z > zmax - NEAR_EXT * H));
       gated = true;
       double sl = amp_ * dsh_(y);
       if (std::fabs(sl) < 1e-3) sl = 1e-3;
       int q = n_meas;
       Hm[q][0] = 1; nu[q] = y - phi_; Rm[q] = (sig / sl) * (sig / sl);
       n_meas++;
+#ifdef LF_DEBUG
+      if (dbg_flat_exit) fprintf(stderr, "t=%.1f FLATEXIT dur=%.1f n=%d dphi=%.4f wind=%d hi_over=%.4f nu=%.4f sigma=%.4f r=%.4f\n",
+                                 t, t - dbg_flat_t0, dbg_flat_n, phi_ - dbg_flat_phi0, dbg_flat_wind, dbg_hi_over, nu[q], std::sqrt(Rm[q] + P_[0][0]), r_);
+#endif
       // The detector confirms a turn only once the field has moved a
       // hysteresis past it; until then a reading just past the turn comes
       // out behind the prediction, on the old branch. While the prediction
@@ -588,8 +615,9 @@ class Tracker {
 #ifdef LF_DEBUG
         dbg_nis = nis;
 #endif
-        nis_ema_ += GATE_ALPHA * (nis - nis_ema_);
-        if (nis_ema_ > GATE) {
+        if (!near_ext) { nis_ema_ += GATE_ALPHA * (nis - nis_ema_); prev_disagree_ = nis > GATE; }   // only a well-determined reading counts as evidence
+        bool fire = nis_ema_ > GATE && (!near_ext || prev_disagree_);
+        if (fire) {
           // The prediction does not explain the position: the flow changed.
           // Let the rate move freely; if the position is far off, take it.
           double sig_r = std::sqrt(P_[1][1]);
@@ -649,12 +677,17 @@ class Tracker {
     // ---- output: the filter's rate, or the time of the last full cycle when
     // the two agree (the shape's small repeating errors cancel over a cycle) ----
     ring_push_(t, !flat && n_meas > 0);
-    r_out_ = r_;
+    double ro = r_;
     double tc;
     if (cycle_ago_(t, tc)) {
       double rc = 1.0 / (t - tc);
-      if (r_ > 0 && std::fabs(rc / r_ - 1) < CYCLE_AGREE) r_out_ = rc;
+      if (r_ > 0 && std::fabs(rc / r_ - 1) < CYCLE_AGREE) ro = rc;
     }
+    // The median of the last three: one reading's excursion never reaches
+    // the output, a real change shows one reading later.
+    out2_ = out1_; out1_ = out0_; out0_ = ro;
+    if (out_n_ < 3) out_n_++;
+    r_out_ = out_n_ < 3 ? ro : std::max(std::min(out0_, out1_), std::min(std::max(out0_, out1_), out2_));
 
     // ---- shape learning, timed by the phase crossing whole cycles ----
     rec_sample_(t, z);
@@ -672,6 +705,8 @@ class Tracker {
   double ma_[MA]; int mi_ = 0, mn_ = 0, m_cur_ = 1;
   bool rising_ = true; double ext_ = 0, ext0_ = 0, ext4_ = 0, H_prev_ = 1.0, dz_avg_ = 0; int rev_n_ = 0;
   bool have_turn_ = false;   // a turn has been believed since the (re)start
+  double out0_ = 0, out1_ = 0, out2_ = 0; int out_n_ = 0;   // the last three output candidates
+  bool prev_disagree_ = false;   // the previous position reading disagreed with the prediction
   bool r_known_ = false;
 
   // ---- (t, phase) ring for the last-cycle time ----
