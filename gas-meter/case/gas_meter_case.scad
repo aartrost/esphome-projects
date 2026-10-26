@@ -20,7 +20,9 @@
 // Print: base back-face down, lid outside-face down. ASA or PETG, 0.2 mm
 // layers. The flare and the XIAO support tabs are <= 45 degrees: no supports.
 //
-//   openscad -D 'part="base"' -o base_top.stl gas_meter_case_top.scad
+//   openscad -D 'part="base"' -o base.stl gas_meter_case.scad
+//   openscad -D 'part="lid"' -o lid_cap.stl gas_meter_case.scad
+//   openscad -D 'antenna=false' -D 'part="lid"' -o lid_plain.stl gas_meter_case.scad   (flat lid, no antenna)
 // part = "base" | "lid" | "assembly" | "closed" | "section" | "fittest" | "antennatest" | "plugs" | "plugtest"
 // =====================================================================
 

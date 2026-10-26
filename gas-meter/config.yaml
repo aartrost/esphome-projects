@@ -26,6 +26,10 @@ substitutions:
   # then back to 'true' (they slow the loop down and reduce accuracy).
   hide_magnetic_field_strength_sensors: 'true'
   hide_half_rotations_total_sensor: 'true'
+  # Diagnostics and tuning entities (Z log, live flow internals, thresholds,
+  # magnet span, axis, ...): hidden from Home Assistant unless set to 'false'.
+  # They keep working on the device either way.
+  hide_diagnostics: 'true'
   # The package blinks an LED as the meter turns; use the XIAO's onboard
   # user LED (GPIO15) instead of the package default GPIO2 (= D2).
   gpio_led: GPIO15
@@ -89,6 +93,7 @@ button:
   - platform: template
     name: "Reset Live Flow Shape"
     entity_category: config
+    internal: ${hide_diagnostics}
     icon: mdi:restore
     on_press:
       - lambda: live_flow::tracker().reset();
@@ -96,6 +101,7 @@ button:
 text_sensor:
   - platform: uptime
     name: Uptime
+    internal: ${hide_diagnostics}
     update_interval: 1d
     format:
       separator: " "
@@ -106,19 +112,17 @@ text_sensor:
     entity_category: diagnostic
     icon: mdi:school
     update_interval: 60s
+    # "Calibrated" once it has learned the waveform from a full cycle since the
+    # last Calibrate axis / Reset Live Flow Shape; "Learning" until then. (It
+    # keeps refining in the background either way.)
     lambda: |-
-      switch (live_flow::tracker().last_learn()) {
-        case 1: return {"Learned a cycle"};
-        case 2: return {"Skipped: flow not steady"};
-        case 3: return {"Skipped: cycle too fast or slow"};
-        case 4: return {"Shape differs, waiting to confirm"};
-        case 5: return {"Adopted a new shape"};
-        case 6: return {"Measuring first cycle"};
-        case 7: return {"Collecting steady cycles"};
-        case 8: return {"Recalibrated, re-learning"};
-        default: break;
-      }
-      return {"Waiting for a steady cycle"};
+      static int calibrated = -1;
+      int last = live_flow::tracker().last_learn();
+      uint32_t n = live_flow::tracker().shape_updates();
+      if (calibrated < 0) calibrated = n > 0;    // after a restart: the saved shape
+      if (last == 8 || n == 0) calibrated = 0;   // recalibrated or reset
+      else if (last == 1 || last == 5) calibrated = 1;
+      return {calibrated ? "Calibrated" : "Learning"};
 
 binary_sensor:
   - platform: status
@@ -127,6 +131,12 @@ binary_sensor:
 sensor:
   # The meter package's count-based Flow is replaced by "Flow (live)".
   - id: !remove sensor_flow
+
+  # Magnetometer range: Z swings ~31-75 uT here, so +-8 gauss (800 uT)
+  # leaves lots of margin and is finer than the driver's default +-30 gauss.
+  # Recalibrate (Calibrate axis) after changing it.
+  - id: !extend qmc5883l_id
+    range: 8G
 
   # Reports the WiFi signal strength/RSSI in dB
   - platform: wifi_signal
@@ -137,16 +147,21 @@ sensor:
 
   # Z-axis log for checking the waveform and count timing in Home Assistant.
   # Averages the raw 200 Hz readings to 2 points per second, so the main
-  # Magnetic Field Strength sensors can stay hidden. Remove when done: at
-  # 2 Hz it adds ~170k rows a day to the HA database.
+  # Exactly what the live flow tracker is fed (2 Hz), so the tracker can be
+  # replayed offline from Home Assistant's history. Adds ~170k rows a day to
+  # the HA database, so it only publishes while the "Z Log" switch is on.
   - platform: copy
-    source_id: qmc5883l_axis_z
+    source_id: live_flow_input
     name: "Magnetic Field Z (log)"
     id: magnetic_field_z_log
     entity_category: "diagnostic"
-    accuracy_decimals: 1
+    unit_of_measurement: "µT"
+    state_class: measurement
+    accuracy_decimals: 3
     filters:
-      - throttle_average: 500ms
+      - lambda: |-
+          if (!id(z_log_enabled).state) return {};
+          return x;
 
   # Live flow converted to heat input; set Heat content from your bill (see below).
   - platform: copy
@@ -163,8 +178,9 @@ sensor:
 
   # Live flow: tracks the meter's position within each cycle from the Z
   # waveform, so it responds in seconds instead of waiting for counts.
-  # Experimental; Total and Flow are unaffected. It adapts to drift and
-  # re-learns the waveform by itself (see gas_live_flow.h).
+  # Total is unaffected. It adapts to drift and re-learns the waveform by
+  # itself (see gas_live_flow.h). Fed at 2 Hz (each value averages ~100 raw
+  # readings); 10 Hz made the real pilot reading scatter more.
   - platform: copy
     source_id: axis_value
     id: live_flow_input
@@ -238,6 +254,7 @@ sensor:
   - platform: template
     name: "Live Flow Offset"
     entity_category: diagnostic
+    internal: ${hide_diagnostics}
     unit_of_measurement: µT
     accuracy_decimals: 2
     update_interval: 60s
@@ -245,6 +262,7 @@ sensor:
   - platform: template
     name: "Live Flow Amplitude"
     entity_category: diagnostic
+    internal: ${hide_diagnostics}
     unit_of_measurement: µT
     accuracy_decimals: 2
     update_interval: 60s
@@ -252,6 +270,7 @@ sensor:
   - platform: template
     name: "Live Flow Noise"
     entity_category: diagnostic
+    internal: ${hide_diagnostics}
     unit_of_measurement: µT
     accuracy_decimals: 3
     update_interval: 60s
@@ -259,10 +278,21 @@ sensor:
   - platform: template
     name: "Live Flow Shape Updates"
     entity_category: diagnostic
+    internal: ${hide_diagnostics}
     state_class: total_increasing
     accuracy_decimals: 0
     update_interval: 60s
     lambda: return (float) live_flow::tracker().shape_updates();
+  # Longest single live-flow update in the last minute, as a CPU check
+  # (ESPHome itself warns when anything blocks the loop for over 30 ms).
+  - platform: template
+    name: "Live Flow Update Time"
+    entity_category: diagnostic
+    internal: ${hide_diagnostics}
+    unit_of_measurement: ms
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: return live_flow::tracker().take_max_update_ms();
 
 # Energy per cubic foot of gas, used by Heat Input. SoCalGas prints a "billing
 # factor" (therms per CCF) on each bill: Heat content = factor x 1000, e.g.
@@ -281,6 +311,26 @@ number:
     restore_value: true
     optimistic: true
 
+  # Set automatically by Calibrate axis (or fixed tuning): no need to show them.
+  - id: !extend magnet_span
+    internal: ${hide_diagnostics}
+  - id: !extend threshold_lower
+    internal: ${hide_diagnostics}
+  - id: !extend threshold_upper
+    internal: ${hide_diagnostics}
+  - id: !extend calibration_seconds
+    internal: ${hide_diagnostics}
+  - id: !extend calibration_minimal_axis_range
+    internal: ${hide_diagnostics}
+
+# The axis is picked by Calibrate axis (Z here); the detection algorithm stays
+# on Adaptive.
+select:
+  - id: !extend axis
+    internal: ${hide_diagnostics}
+  - id: !extend detection_algorithm
+    internal: ${hide_diagnostics}
+
 # Antenna RF switch (FM8625H) using ESPHome 2025.12+ board aliases.
 # Both antennas go through this switch, so it must be enabled even for the
 # built-in antenna. GPIO switches (not on_boot) so we don't override the
@@ -288,6 +338,16 @@ number:
 #   RF_SWITCH_EN  (GPIO3):  LOW = RF switch powered
 #   RF_ANT_SELECT (GPIO14): LOW = built-in ceramic antenna, HIGH = external U.FL
 switch:
+  # Publish "Magnetic Field Z (log)" (the tracker's 2 Hz input) to Home
+  # Assistant. Survives restarts; no flash needed to turn it on or off.
+  - platform: template
+    name: "Z Log"
+    id: z_log_enabled
+    entity_category: config
+    icon: mdi:chart-line
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
   - platform: gpio
     id: rf_switch_enable
     pin: RF_SWITCH_EN
