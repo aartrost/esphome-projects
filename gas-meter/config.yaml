@@ -298,6 +298,10 @@ sensor:
 # factor" (therms per CCF) on each bill: Heat content = factor x 1000, e.g.
 # 1.032 -> 1032 BTU/ft3. It drifts a percent or two month to month.
 number:
+  # Enforce 3 decimals here, otherwise we see strange float rounding behavior
+  - id: !extend volume_per_half_rotation
+    step: 0.001
+
   - platform: template
     id: heat_content
     name: "Heat Content"
