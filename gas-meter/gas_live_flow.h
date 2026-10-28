@@ -311,7 +311,7 @@ class Tracker {
     r_ = 0; init_cov_();
     P_[1][1] = 1e-3 * 1e-3;   // rate unknown but small: it will be measured in seconds
     tp_ = t; started_ = true; rn_ = 0; nis_ema_ = 0;
-    t_inf_ = -1e9; p_inf_ = 0; dz_avg_ = 0; n2_ = 0; in_run_ = 10; have_turn_ = false; prev_disagree_ = false; out_n_ = 0; out_frac_ = 0; lost_ = false;
+    t_inf_ = -1e9; p_inf_ = 0; dz_avg_ = 0; n2_ = 0; in_run_ = 10; have_turn_ = false; prev_disagree_ = false; out_n_ = 0; have_pk_ = have_tr_ = false; out_frac_ = 0; lost_ = false;
     ring_push_(t);
     last_cross_ = std::floor(phi_);
     return false;
@@ -456,6 +456,7 @@ class Tracker {
     // guess was wrong the first "turn" is just the starting level.
     bool real_ext = turned && std::fabs(ext_ - ext0_) > H;
     if (turned) {
+      if (turn_peak) { last_pk_ = turn_val; have_pk_ = true; } else { last_tr_ = turn_val; have_tr_ = true; }
       ext_ = ext0_ = zx; ext4_ = zx4; rev_n_ = 0; have_turn_ = true;
       // the reference calibration follows the level only in small steps, one
       // per turn: a runaway of the level states after the sensor moved must
@@ -497,6 +498,17 @@ class Tracker {
     int n_meas = 0;
     double Hm[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, nu[3] = {0, 0, 0}, Rm[3] = {1, 1, 1};
     bool gated = false, near_ext = false;
+    if (turned && real_ext && period <= 40 * dt_avg_ && period >= 16 * dt_avg_ && have_pk_ && have_tr_) {
+      // A fast cycle: each reading averages half a second of field, which
+      // pulls both extremes toward the middle, so neither measures the
+      // amplitude - but their midpoint still measures the offset, and the
+      // magnet's field drifts as gas flows (it cools), so that matters over
+      // a long burn. Not on very fast cycles, where the flattening is large
+      // and the two extremes (of different widths) no longer flatten alike.
+      Hm[0][2] = 1; nu[0] = 0.5 * (last_pk_ + last_tr_) - (off_ + amp_ * 0.5 * (smax_ + smin_));
+      Rm[0] = nvar_ + (0.02 * amp_) * (0.02 * amp_);
+      n_meas = 1;
+    }
     if (turned && real_ext && period > 40 * dt_avg_) {
       // A confirmed turn of a cycle with enough samples to catch the extreme:
       // its extreme (the peak or trough of the smoothed field) measures the
@@ -705,6 +717,7 @@ class Tracker {
   double ma_[MA]; int mi_ = 0, mn_ = 0, m_cur_ = 1;
   bool rising_ = true; double ext_ = 0, ext0_ = 0, ext4_ = 0, H_prev_ = 1.0, dz_avg_ = 0; int rev_n_ = 0;
   bool have_turn_ = false;   // a turn has been believed since the (re)start
+  double last_pk_ = 0, last_tr_ = 0; bool have_pk_ = false, have_tr_ = false;   // the last believed peak and trough
   double out0_ = 0, out1_ = 0, out2_ = 0; int out_n_ = 0;   // the last three output candidates
   bool prev_disagree_ = false;   // the previous position reading disagreed with the prediction
   bool r_known_ = false;
